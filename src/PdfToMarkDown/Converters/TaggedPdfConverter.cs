@@ -1,98 +1,169 @@
+using System.Text.RegularExpressions;
 using UglyToad.PdfPig;
 using UglyToad.PdfPig.Content;
+using UglyToad.PdfPig.DocumentLayoutAnalysis.WordExtractor;
 
 namespace PdfToMarkDown.Converters;
 
 public class TaggedPdfConverter : IPdfToMarkdownConverter
 {
+    private static readonly Regex MultiSpaceRegex = new(@" {2,}", RegexOptions.Compiled);
+
+    // Per-page MCID lookup: pageNumber -> (mcid -> MarkedContentElement)
+    private Dictionary<int, Dictionary<int, MarkedContentElement>> _mcidLookup = new();
+
     public string Convert(string pdfPath)
     {
         var md = new MarkdownBuilder();
 
         using var document = PdfDocument.Open(pdfPath);
 
-        foreach (var page in document.GetPages())
-        {
-            var markedContents = page.GetMarkedContents();
+        // Step 1: Read the structure tree
+        var root = StructureTreeReader.Read(document);
+        if (root == null)
+            return string.Empty;
 
-            foreach (var element in markedContents)
-            {
-                ProcessElement(element, md, new ConversionState());
-            }
+        // Step 2: Build per-page MCID lookup from content stream
+        BuildMcidLookup(document);
+
+        // Step 3: Walk the structure tree and generate Markdown
+        foreach (var child in root.Children)
+        {
+            ProcessNode(child, md);
         }
 
         return md.ToString();
     }
 
-    private void ProcessElement(MarkedContentElement element, MarkdownBuilder md, ConversionState state)
+    private void BuildMcidLookup(PdfDocument document)
     {
-        if (element.IsArtifact)
-            return;
+        _mcidLookup = new Dictionary<int, Dictionary<int, MarkedContentElement>>();
 
-        var tag = element.Tag?.ToUpperInvariant() ?? string.Empty;
+        foreach (var page in document.GetPages())
+        {
+            var pageLookup = new Dictionary<int, MarkedContentElement>();
+            var markedContents = page.GetMarkedContents();
+            IndexMarkedContents(markedContents, pageLookup);
+            _mcidLookup[page.Number] = pageLookup;
+        }
+    }
+
+    private void IndexMarkedContents(IReadOnlyList<MarkedContentElement> elements, Dictionary<int, MarkedContentElement> lookup)
+    {
+        foreach (var element in elements)
+        {
+            if (element.MarkedContentIdentifier >= 0)
+            {
+                lookup[element.MarkedContentIdentifier] = element;
+            }
+
+            // Recurse into children to find nested MCIDs
+            if (element.Children.Count > 0)
+            {
+                IndexMarkedContents(element.Children, lookup);
+            }
+        }
+    }
+
+    private void ProcessNode(StructureNode node, MarkdownBuilder md)
+    {
+        var tag = node.Tag.ToUpperInvariant();
 
         switch (tag)
         {
             case "H1":
-                md.AppendHeading(1, ExtractText(element));
+                md.AppendHeading(1, ExtractNodeText(node));
                 return;
             case "H2":
-                md.AppendHeading(2, ExtractText(element));
+                md.AppendHeading(2, ExtractNodeText(node));
                 return;
             case "H3":
-                md.AppendHeading(3, ExtractText(element));
+                md.AppendHeading(3, ExtractNodeText(node));
                 return;
             case "H4":
-                md.AppendHeading(4, ExtractText(element));
+                md.AppendHeading(4, ExtractNodeText(node));
                 return;
             case "H5":
-                md.AppendHeading(5, ExtractText(element));
+                md.AppendHeading(5, ExtractNodeText(node));
                 return;
             case "H6":
-                md.AppendHeading(6, ExtractText(element));
+                md.AppendHeading(6, ExtractNodeText(node));
                 return;
+
             case "P":
-            case "SPAN":
-                var text = ExtractText(element);
-                if (!string.IsNullOrWhiteSpace(text))
-                    md.AppendParagraph(text);
+                var pText = ExtractNodeText(node);
+                if (!string.IsNullOrWhiteSpace(pText))
+                    md.AppendParagraph(pText);
                 return;
+
             case "L":
-                ProcessList(element, md);
+                ProcessList(node, md);
                 return;
+
             case "TABLE":
-                ProcessTable(element, md);
+                ProcessTable(node, md);
                 return;
+
             case "FIGURE":
-                var alt = element.AlternateDescription ?? "Figure";
-                md.AppendFigurePlaceholder(alt);
+                md.AppendFigurePlaceholder("Figure");
                 return;
-        }
 
-        // For unknown tags or structural containers, recurse into children
-        foreach (var child in element.Children)
-        {
-            ProcessElement(child, md, state);
-        }
+            case "LINK":
+            case "SPAN":
+                // Inline elements - extract text and emit as paragraph
+                var inlineText = ExtractNodeText(node);
+                if (!string.IsNullOrWhiteSpace(inlineText))
+                    md.AppendParagraph(inlineText);
+                return;
 
-        // If no children but has letters directly, emit as paragraph
-        if (element.Children.Count == 0 && element.Letters.Count > 0)
-        {
-            var directText = ExtractText(element);
-            if (!string.IsNullOrWhiteSpace(directText))
-                md.AppendParagraph(directText);
+            case "NOTE":
+            case "FOOTNOTE":
+                var noteText = ExtractNodeText(node);
+                if (!string.IsNullOrWhiteSpace(noteText))
+                    md.AppendParagraph(noteText);
+                return;
+
+            case "ARTIFACT":
+            case "HEADER":
+            case "FOOTER":
+                // Skip artifacts and header/footer
+                return;
+
+            case "DOCUMENT":
+            case "SECT":
+            case "PART":
+            case "DIV":
+            case "ART":
+            case "BLOCKQUOTE":
+            case "TOC":
+            case "TOCI":
+            default:
+                // Structural containers or unknown tags - recurse into children
+                foreach (var child in node.Children)
+                {
+                    ProcessNode(child, md);
+                }
+
+                // If no children but has direct MCID refs, emit as paragraph
+                if (node.Children.Count == 0 && node.McidRefs.Count > 0)
+                {
+                    var text = ExtractNodeText(node);
+                    if (!string.IsNullOrWhiteSpace(text))
+                        md.AppendParagraph(text);
+                }
+                return;
         }
     }
 
-    private void ProcessList(MarkedContentElement listElement, MarkdownBuilder md)
+    private void ProcessList(StructureNode listNode, MarkdownBuilder md)
     {
         md.EnsureBlankLine();
         int itemNumber = 0;
         bool isOrdered = false;
 
-        foreach (var child in listElement.Children)
+        foreach (var child in listNode.Children)
         {
-            var childTag = child.Tag?.ToUpperInvariant() ?? string.Empty;
+            var childTag = child.Tag.ToUpperInvariant();
             if (childTag == "LI")
             {
                 itemNumber++;
@@ -110,29 +181,34 @@ public class TaggedPdfConverter : IPdfToMarkdownConverter
                 else
                     md.AppendBulletItem(bodyText);
             }
+            else
+            {
+                // Nested structure within list - recurse
+                ProcessNode(child, md);
+            }
         }
     }
 
-    private string ExtractListItemText(MarkedContentElement liElement, out string label)
+    private string ExtractListItemText(StructureNode liNode, out string label)
     {
         label = string.Empty;
         var bodyParts = new List<string>();
 
-        foreach (var child in liElement.Children)
+        foreach (var child in liNode.Children)
         {
-            var childTag = child.Tag?.ToUpperInvariant() ?? string.Empty;
+            var childTag = child.Tag.ToUpperInvariant();
             switch (childTag)
             {
                 case "LBL":
-                    label = ExtractText(child);
+                    label = ExtractNodeText(child);
                     break;
                 case "LBODY":
-                    var text = ExtractText(child);
+                    var text = ExtractNodeText(child);
                     if (!string.IsNullOrWhiteSpace(text))
                         bodyParts.Add(text);
                     break;
                 default:
-                    var fallback = ExtractText(child);
+                    var fallback = ExtractNodeText(child);
                     if (!string.IsNullOrWhiteSpace(fallback))
                         bodyParts.Add(fallback);
                     break;
@@ -141,8 +217,8 @@ public class TaggedPdfConverter : IPdfToMarkdownConverter
 
         if (bodyParts.Count == 0)
         {
-            // Try direct letters on the LI element
-            var directText = ExtractText(liElement);
+            // Try direct MCID refs on the LI node
+            var directText = ExtractTextFromMcidRefs(liNode.McidRefs);
             if (!string.IsNullOrWhiteSpace(directText))
                 bodyParts.Add(directText);
         }
@@ -150,21 +226,20 @@ public class TaggedPdfConverter : IPdfToMarkdownConverter
         return string.Join(" ", bodyParts);
     }
 
-    private void ProcessTable(MarkedContentElement tableElement, MarkdownBuilder md)
+    private void ProcessTable(StructureNode tableNode, MarkdownBuilder md)
     {
         var rows = new List<List<string>>();
         bool hasHeader = false;
 
-        foreach (var child in tableElement.Children)
+        foreach (var child in tableNode.Children)
         {
-            var childTag = child.Tag?.ToUpperInvariant() ?? string.Empty;
+            var childTag = child.Tag.ToUpperInvariant();
             if (childTag == "THEAD")
             {
                 hasHeader = true;
                 foreach (var row in child.Children)
                 {
-                    var rowTag = row.Tag?.ToUpperInvariant() ?? string.Empty;
-                    if (rowTag == "TR")
+                    if (row.Tag.ToUpperInvariant() == "TR")
                         rows.Add(ExtractTableRow(row));
                 }
             }
@@ -172,8 +247,7 @@ public class TaggedPdfConverter : IPdfToMarkdownConverter
             {
                 foreach (var row in child.Children)
                 {
-                    var rowTag = row.Tag?.ToUpperInvariant() ?? string.Empty;
-                    if (rowTag == "TR")
+                    if (row.Tag.ToUpperInvariant() == "TR")
                         rows.Add(ExtractTableRow(row));
                 }
             }
@@ -194,29 +268,26 @@ public class TaggedPdfConverter : IPdfToMarkdownConverter
                 row.Add(string.Empty);
         }
 
-        // First row is header if THEAD was found, or use first row as header
-        var headerRow = rows[0];
-        md.AppendTableHeader(headerRow);
+        // First row is header
+        md.AppendTableHeader(rows[0]);
 
-        int startIndex = hasHeader ? GetHeaderRowCount(tableElement) : 1;
+        int startIndex = hasHeader ? GetHeaderRowCount(tableNode) : 1;
         for (int i = startIndex; i < rows.Count; i++)
         {
             md.AppendTableRow(rows[i]);
         }
     }
 
-    private int GetHeaderRowCount(MarkedContentElement tableElement)
+    private int GetHeaderRowCount(StructureNode tableNode)
     {
         int count = 0;
-        foreach (var child in tableElement.Children)
+        foreach (var child in tableNode.Children)
         {
-            var tag = child.Tag?.ToUpperInvariant() ?? string.Empty;
-            if (tag == "THEAD")
+            if (child.Tag.ToUpperInvariant() == "THEAD")
             {
                 foreach (var row in child.Children)
                 {
-                    var rowTag = row.Tag?.ToUpperInvariant() ?? string.Empty;
-                    if (rowTag == "TR")
+                    if (row.Tag.ToUpperInvariant() == "TR")
                         count++;
                 }
             }
@@ -224,128 +295,133 @@ public class TaggedPdfConverter : IPdfToMarkdownConverter
         return count > 0 ? count : 1;
     }
 
-    private List<string> ExtractTableRow(MarkedContentElement rowElement)
+    private List<string> ExtractTableRow(StructureNode rowNode)
     {
         var cells = new List<string>();
-        foreach (var cell in rowElement.Children)
+        foreach (var cell in rowNode.Children)
         {
-            cells.Add(ExtractText(cell));
+            cells.Add(ExtractNodeText(cell));
         }
 
-        // If no children, try the row's own letters
-        if (cells.Count == 0 && rowElement.Letters.Count > 0)
+        // If no children but has direct MCID refs
+        if (cells.Count == 0 && rowNode.McidRefs.Count > 0)
         {
-            cells.Add(ExtractText(rowElement));
+            cells.Add(ExtractTextFromMcidRefs(rowNode.McidRefs));
         }
 
         return cells;
     }
 
-    private string ExtractText(MarkedContentElement element)
+    /// <summary>
+    /// Extract text for a structure node by collecting letters from all its MCID refs
+    /// and recursively from child nodes.
+    /// </summary>
+    private string ExtractNodeText(StructureNode node)
     {
-        // Prefer ActualText replacement if available
-        if (!string.IsNullOrEmpty(element.ActualText))
-            return element.ActualText;
-
-        // Collect all letters from this element and its children
-        var allLetters = CollectLetters(element);
+        var allLetters = new List<Letter>();
+        CollectLettersFromNode(node, allLetters);
 
         if (allLetters.Count == 0)
             return string.Empty;
 
-        // Sort by reading order: top-to-bottom, then left-to-right
-        var sorted = allLetters
-            .OrderByDescending(l => l.GlyphRectangle.Top)
-            .ThenBy(l => l.GlyphRectangle.Left)
-            .ToList();
-
-        var sb = new System.Text.StringBuilder();
-        Letter? prev = null;
-
-        foreach (var letter in sorted)
-        {
-            if (prev != null)
-            {
-                // Detect line break: significant vertical gap
-                double verticalGap = Math.Abs(prev.GlyphRectangle.Top - letter.GlyphRectangle.Top);
-                if (verticalGap > prev.GlyphRectangle.Height * 0.5)
-                {
-                    sb.Append(' ');
-                }
-                else
-                {
-                    // Detect word spacing: horizontal gap
-                    double horizontalGap = letter.GlyphRectangle.Left - prev.GlyphRectangle.Right;
-                    double spaceThreshold = prev.GlyphRectangle.Width * 0.3;
-                    if (horizontalGap > spaceThreshold)
-                    {
-                        sb.Append(' ');
-                    }
-                }
-            }
-
-            sb.Append(letter.Value);
-            prev = letter;
-        }
-
-        return sb.ToString().Trim();
+        return LettersToText(allLetters);
     }
 
-    private List<Letter> CollectLetters(MarkedContentElement element)
+    private void CollectLettersFromNode(StructureNode node, List<Letter> letters)
     {
-        var letters = new List<Letter>(element.Letters);
+        // Collect from direct MCID refs
+        foreach (var mcidRef in node.McidRefs)
+        {
+            var element = LookupMcid(mcidRef.PageNumber, mcidRef.Mcid);
+            if (element != null)
+            {
+                CollectLettersFromElement(element, letters);
+            }
+        }
+
+        // Collect from children
+        foreach (var child in node.Children)
+        {
+            CollectLettersFromNode(child, letters);
+        }
+    }
+
+    private void CollectLettersFromElement(MarkedContentElement element, List<Letter> letters)
+    {
+        letters.AddRange(element.Letters);
 
         foreach (var child in element.Children)
         {
             if (!child.IsArtifact)
-                letters.AddRange(CollectLetters(child));
+                CollectLettersFromElement(child, letters);
         }
-
-        return letters;
     }
 
-    /// <summary>
-    /// Checks whether a page has meaningful tagged structure (not just Artifact markers).
-    /// </summary>
-    public static bool HasMeaningfulTags(IReadOnlyList<MarkedContentElement> markedContents)
+    private string ExtractTextFromMcidRefs(List<McidReference> mcidRefs)
     {
-        foreach (var element in markedContents)
+        var allLetters = new List<Letter>();
+
+        foreach (var mcidRef in mcidRefs)
         {
-            if (HasStructureTag(element))
-                return true;
+            var element = LookupMcid(mcidRef.PageNumber, mcidRef.Mcid);
+            if (element != null)
+            {
+                CollectLettersFromElement(element, allLetters);
+            }
         }
-        return false;
+
+        if (allLetters.Count == 0)
+            return string.Empty;
+
+        return LettersToText(allLetters);
     }
 
-    private static readonly HashSet<string> StructureTags = new(StringComparer.OrdinalIgnoreCase)
+    private MarkedContentElement? LookupMcid(int pageNumber, int mcid)
     {
-        "H1", "H2", "H3", "H4", "H5", "H6",
-        "P", "SPAN", "L", "LI", "LBL", "LBODY",
-        "TABLE", "TR", "TD", "TH", "THEAD", "TBODY",
-        "FIGURE", "SECT", "DIV", "BLOCKQUOTE",
-        "DOCUMENT", "PART", "ART", "TOC", "TOCI"
-    };
-
-    private static bool HasStructureTag(MarkedContentElement element)
-    {
-        if (element.IsArtifact)
-            return false;
-
-        var tag = element.Tag ?? string.Empty;
-        if (StructureTags.Contains(tag))
-            return true;
-
-        foreach (var child in element.Children)
+        if (_mcidLookup.TryGetValue(pageNumber, out var pageLookup))
         {
-            if (HasStructureTag(child))
-                return true;
+            if (pageLookup.TryGetValue(mcid, out var element))
+                return element;
         }
-
-        return false;
+        return null;
     }
 
-    private class ConversionState
+    private string LettersToText(List<Letter> allLetters)
     {
-        // Reserved for future state tracking during recursive processing
+        if (allLetters.Count == 0)
+            return string.Empty;
+
+        var words = NearestNeighbourWordExtractor.Instance.GetWords(allLetters);
+        var wordList = words.ToList();
+
+        if (wordList.Count == 0)
+            return string.Empty;
+
+        // Build a lookup: for each letter, find its index in the collection order
+        var letterIndex = new Dictionary<Letter, int>();
+        for (int i = 0; i < allLetters.Count; i++)
+            letterIndex[allLetters[i]] = i;
+
+        // Order words by the minimum content stream index of any of their letters
+        var orderedWords = wordList
+            .Select(w => new
+            {
+                Word = w,
+                StreamIndex = w.Letters.Min(l => letterIndex.GetValueOrDefault(l, int.MaxValue))
+            })
+            .OrderBy(x => x.StreamIndex)
+            .Select(x => x.Word)
+            .ToList();
+
+        var sb = new System.Text.StringBuilder();
+
+        for (int i = 0; i < orderedWords.Count; i++)
+        {
+            if (i > 0)
+                sb.Append(' ');
+            sb.Append(orderedWords[i].Text);
+        }
+
+        return MultiSpaceRegex.Replace(sb.ToString().Trim(), " ");
     }
 }

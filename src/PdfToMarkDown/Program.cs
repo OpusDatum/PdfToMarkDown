@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using PdfToMarkDown;
 using PdfToMarkDown.Converters;
 using UglyToad.PdfPig;
 
@@ -37,13 +38,7 @@ int pageCount;
 using (var probe = PdfDocument.Open(pdfPath))
 {
     pageCount = probe.NumberOfPages;
-
-    if (pageCount > 0)
-    {
-        var firstPage = probe.GetPage(1);
-        var markedContents = firstPage.GetMarkedContents();
-        useTagged = TaggedPdfConverter.HasMeaningfulTags(markedContents);
-    }
+    useTagged = StructureTreeReader.HasStructureTree(probe);
 }
 
 string strategyName;
@@ -68,9 +63,15 @@ var markdown = converter.Convert(pdfPath);
 
 File.WriteAllText(outputPath, markdown);
 
+// Generate structure tree summary from StructTreeRoot (the real semantic tags)
+var tagsOutputPath = Path.ChangeExtension(pdfPath, ".tags.txt");
+var tagSummary = StructureTreeDumper.Dump(pdfPath);
+File.WriteAllText(tagsOutputPath, tagSummary);
+
 sw.Stop();
 
 Console.WriteLine($"Done in {sw.Elapsed.TotalSeconds:F1}s");
 Console.WriteLine($"Output written to: {outputPath}");
+Console.WriteLine($"Tag summary written to: {tagsOutputPath}");
 
 return 0;
